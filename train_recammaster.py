@@ -207,6 +207,57 @@ class TensorDataset(torch.utils.data.Dataset):
         ret_poses = np.array(ret_poses, dtype=np.float32)
         return ret_poses
     
+    def ray_condition(self, K, c2w, device, flip_flag=None, H=480, W=832):
+        # c2w: B, V, 4, 4
+        # K: B, V, 4
+
+        B, V = K.shape[:2]
+        def custom_meshgrid(*args):
+            from packaging import version as pver
+            # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
+            if pver.parse(torch.__version__) < pver.parse('1.10'):
+                return torch.meshgrid(*args)
+            else:
+                return torch.meshgrid(*args, indexing='ij')
+
+        j, i = custom_meshgrid(
+            torch.linspace(0, H - 1, H, device=device, dtype=c2w.dtype),
+            torch.linspace(0, W - 1, W, device=device, dtype=c2w.dtype),
+        )
+        i = i.reshape([1, 1, H * W]).expand([B, V, H * W]) + 0.5          # [B, V, HxW]
+        j = j.reshape([1, 1, H * W]).expand([B, V, H * W]) + 0.5          # [B, V, HxW]
+
+        n_flip = torch.sum(flip_flag).item() if flip_flag is not None else 0
+        if n_flip > 0:
+            j_flip, i_flip = custom_meshgrid(
+                torch.linspace(0, H - 1, H, device=device, dtype=c2w.dtype),
+                torch.linspace(W - 1, 0, W, device=device, dtype=c2w.dtype)
+            )
+            i_flip = i_flip.reshape([1, 1, H * W]).expand(B, 1, H * W) + 0.5
+            j_flip = j_flip.reshape([1, 1, H * W]).expand(B, 1, H * W) + 0.5
+            i[:, flip_flag, ...] = i_flip
+            j[:, flip_flag, ...] = j_flip
+
+        fx, fy, cx, cy = K.chunk(4, dim=-1)     # B,V, 1
+
+        zs = torch.ones_like(i)                 # [B, V, HxW]
+        xs = (i - cx) / fx * zs
+        ys = (j - cy) / fy * zs
+        zs = zs.expand_as(ys)
+
+        directions = torch.stack((xs, ys, zs), dim=-1)              # B, V, HW, 3
+        directions = directions / directions.norm(dim=-1, keepdim=True)             # B, V, HW, 3
+
+        rays_d = directions @ c2w[..., :3, :3].transpose(-1, -2)        # B, V, HW, 3
+        rays_o = c2w[..., :3, 3]                                        # B, V, 3
+        rays_o = rays_o[:, :, None].expand_as(rays_d)                   # B, V, HW, 3
+        # c2w @ dirctions
+        rays_dxo = torch.cross(rays_o, rays_d)                          # B, V, HW, 3
+        plucker = torch.cat([rays_dxo, rays_d], dim=-1)
+        plucker = plucker.reshape(B, c2w.shape[1], H, W, 6)             # B, V, H, W, 6
+        # plucker = plucker.permute(0, 1, 4, 2, 3)
+        return plucker
+    
     def __getitem__(self, index):
         # Return: 
         # data['latents']: torch.Size([16, 21*2, 60, 104])
@@ -220,7 +271,7 @@ class TensorDataset(torch.utils.data.Dataset):
                 path_tgt = self.path[data_id]
                 ### get focal length and aperture
                 pattern = r'f(\d+)_aperture(\d+\.\d+)'
-                match = re.search(pattern, path)
+                match = re.search(pattern, path_tgt)
                 focal_length = float(match.group(1))
                 d = 23.76 / 1280
                 fx=focal_length/d
@@ -262,21 +313,23 @@ class TensorDataset(torch.utils.data.Dataset):
                     multiview_c2ws.append(c2ws)
                 cond_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[0]]
                 tgt_cam_params = [Camera(cam_param) for cam_param in multiview_c2ws[1]]
-                relative_poses = []
-                for i in range(len(tgt_cam_params)):
-                    relative_pose = self.get_relative_pose([cond_cam_params[0], tgt_cam_params[i]])
-                    relative_poses.append(torch.as_tensor(relative_pose)[1])
-                pose_embedding = torch.stack(relative_poses, dim=0)  # 21x4x4
-                n_frames = pose_embedding.shape[0]
+                relative_poses = self.get_relative_pose(tgt_cam_params)
+                pose_embedding = torch.as_tensor(relative_poses)[None] # [1, n_frame, 4, 4]
+
+                # relative_poses = []
+                # for i in range(len(tgt_cam_params)):
+                #     relative_pose = self.get_relative_pose([cond_cam_params[0], tgt_cam_params[i]])
+                #     relative_poses.append(torch.as_tensor(relative_pose)[1])
+                # pose_embedding = torch.stack(relative_poses, dim=0)  # 21x4x4
+                n_frames = pose_embedding.shape[1]
                 intrinsics = np.asarray([[fx,fy,cx,cy]])
                 intrinsics = torch.as_tensor(intrinsics)
                 intrinsics = intrinsics.repeat(1,n_frames,1) # [1, n_frame, 4]
-                pose_embedding = pose_embedding.unsqueeze(0) # [1, n_frame, 4, 4]
+                # pose_embedding = pose_embedding.unsqueeze(0) # [1, n_frame, 4, 4]
                 flip_flag = torch.zeros(n_frames, dtype=torch.bool, device=c2w.device)
-                plucker_embedding = ray_condition(intrinsics, c2w, self.sample_size[0], self.sample_size[1], device='cpu',
-                                                                  flip_flag=flip_flag)[0].permute(0, 3, 1, 2).contiguous()
-                pose_embedding = rearrange(pose_embedding, 'b c d -> b (c d)')
-                data['camera'] = pose_embedding.to(torch.bfloat16)
+                plucker_embedding = self.ray_condition(intrinsics, c2w, device='cpu',
+                                                                  flip_flag=flip_flag)[0].permute(0, 3, 1, 2).contiguous() # V, 6, H, W
+                data['camera'] = plucker_embedding.to(torch.bfloat16)
                 break
             except Exception as e:
                 print(f"ERROR WHEN LOADING: {e}")
@@ -318,8 +371,8 @@ class LightningModelForTrain(pl.LightningModule):
         state_dict_to_load = {}
         for key, value in state_dict.items():
             state_dict_to_load[key] = value
-        missing, unexpected = self.pipe.dit.load_state_dict(state_dict_to_load, assign=True, strict=False)
-        print(f'Missing: {len(missing)}, Unexpected: {len(unexpected)}')
+        dit_missing, dit_unexpected = self.pipe.dit.load_state_dict(state_dict_to_load, assign=True, strict=False)
+        print(f'Dit Missing: {len(dit_missing)}, Dit Unexpected: {len(dit_unexpected)}')
         self.pipe.scheduler.set_timesteps(1000, training=True)
         self.freeze_parameters()
 
@@ -335,8 +388,10 @@ class LightningModelForTrain(pl.LightningModule):
             param.requires_grad_(False)
         
         for name, param in model.named_parameters():
-            if "control_blocks" in name:
+            if name in dit_missing:
                 param.requires_grad_(True)
+            # if "control_blocks" in name:
+            #     param.requires_grad_(True)
         
         trainable_params = 0
         train_params_names = []
@@ -383,6 +438,7 @@ class LightningModelForTrain(pl.LightningModule):
             image_emb["y"] = image_emb["y"][0].to(self.device)
         
         cam_emb = batch["camera"].to(self.device)
+        cam_emb = cam_emb[None] # [1, V, 6, H, W]
 
         # Loss
         self.pipe.device = self.device
@@ -400,15 +456,7 @@ class LightningModelForTrain(pl.LightningModule):
         training_target = self.pipe.scheduler.training_target(target_latents, noise, timestep).to(device=self.pipe.device)
         # model_input = torch.cat([noisy_target_latents, source_latents, render_latents], dim=2).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
         model_input = noisy_target_latents.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-        controlnet_input = torch.cat([noisy_target_latents, source_latents], dim=2).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-
-        # ================== model input & condition ==================
-        noise = torch.randn_like(target_latents)
-        noisy_target_latents = self.pipe.scheduler.add_noise(target_latents, noise, timestep)
-        training_target = self.pipe.scheduler.training_target(target_latents, noise, timestep).to(device=self.pipe.device)
-        # model_input = torch.cat([noisy_target_latents, source_latents, render_latents], dim=2).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-        model_input = noisy_target_latents.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-        controlnet_input = torch.cat([noisy_target_latents, source_latents], dim=2).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+        controlnet_input = noisy_target_latents.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
         # ================== Forward & Compute loss ==================
         tgt_latent_len = training_target.shape[2]

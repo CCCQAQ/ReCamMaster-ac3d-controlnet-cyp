@@ -361,6 +361,22 @@ def model_fn_wan_video(
     tea_cache: TeaCache = None,
     **kwargs,
 ):
+    ########## add cam process block ##########
+    batch_size, num_frames, channels, height, width = cam_emb.shape
+    cam_emb = rearrange(cam_emb, 'b f c h w -> (b f) c h w')
+    cam_emb = dit.unshuffle(cam_emb)
+    cam_emb = dit.controlnet_encode_first(cam_emb)
+    cam_emb = dit.compress_time(cam_emb, num_frames=num_frames) 
+    num_frames = cam_emb.shape[0] // batch_size
+
+    cam_emb = dit.controlnet_encode_second(cam_emb)
+    cam_emb = dit.compress_time(cam_emb, num_frames=num_frames) 
+    cam_emb = rearrange(cam_emb, '(b f) c h w -> b f c h w', b=batch_size)
+
+    cam_emb = rearrange(cam_emb, 'b f c h w -> b c f h w')
+    x_c = torch.cat([x_c, cam_emb], dim=1)
+    ########## add cam process block ##########
+
     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
     t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
     context = dit.text_embedding(context)
@@ -370,7 +386,10 @@ def model_fn_wan_video(
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)
     
+    # DiT input
     x, (f, h, w) = dit.patchify(x)
+    # Control Input
+    x_c, (f_c, h_c, w_c) = dit.patchify(x_c)
     
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -378,6 +397,11 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
     
+    freqs_c = torch.cat([
+        dit.freqs[0][:f_c].view(f_c, 1, 1, -1).expand(f_c, h_c, w_c, -1),
+        dit.freqs[1][:h_c].view(1, h_c, 1, -1).expand(f_c, h_c, w_c, -1),
+        dit.freqs[2][:w_c].view(1, 1, w_c, -1).expand(f_c, h_c, w_c, -1)
+    ], dim=-1).reshape(f_c * h_c * w_c, 1, -1).to(x.device) 
     # TeaCache
     tea_cache=None
     if tea_cache is not None:
@@ -389,8 +413,11 @@ def model_fn_wan_video(
         x = tea_cache.update(x)
     else:
         # blocks
-        for block in dit.blocks:
+        for idx, block in enumerate(dit.blocks):
             x = block(x, context, cam_emb, t_mod, freqs)
+            if idx < dit.num_control_layers:
+                x_c = dit.control_blocks[idx](x_c, context, t_mod, freqs_c)
+                x = x + dit.control_blocks[idx].zero_linear(x_c)[:,:x.shape[1]]
         if tea_cache is not None:
             tea_cache.store(x)
 

@@ -211,114 +211,6 @@ class DiTBlock(nn.Module):
         x = x + gate_mlp * self.ffn(input_x)
         return x
 
-##### add controlnet
-class ControlBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.ffn_dim = ffn_dim
-
-        self.self_attn = SelfAttention(dim, num_heads, eps)
-        self.cross_attn = CrossAttention(
-            dim, num_heads, eps, has_image_input=has_image_input)
-        
-
-
-        # ac3d controlnet
-        in_channels = 6 
-        downscale_coef = 8
-        start_channels = in_channels * (downscale_coef ** 2)
-        input_channels = [start_channels, start_channels // 2, start_channels // 4]
-        self.unshuffle = nn.PixelUnshuffle(downscale_coef)
-
-        self.controlnet_encode_first = nn.Sequential(
-            nn.Conv2d(input_channels[0], input_channels[1], kernel_size=1, stride=1, padding=0),
-            nn.GroupNorm(2, input_channels[1]),
-            nn.ReLU(),
-        )
-
-        self.controlnet_encode_second = nn.Sequential(
-            nn.Conv2d(input_channels[1], input_channels[2], kernel_size=1, stride=1, padding=0),
-            nn.GroupNorm(2, input_channels[2]),
-            nn.ReLU(),
-        )
-
-        # self.cam_encoder = nn.Linear(12, dim)
-        # self.cam_encoder.weight.data.zero_()
-        # self.cam_encoder.bias.data.zero_()
-        # self.projector = nn.Linear(dim, dim)
-        # self.projector.weight = nn.Parameter(torch.eye(dim))
-        # self.projector.bias = nn.Parameter(torch.zeros(dim))
-
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(dim, eps=eps)
-        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
-            approximate='tanh'), nn.Linear(ffn_dim, dim))
-        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-
-    def compress_time(self, x, num_frames):
-        x = rearrange(x, '(b f) c h w -> b f c h w', f=num_frames)
-        batch_size, frames, channels, height, width = x.shape
-        x = rearrange(x, 'b f c h w -> (b h w) c f')
-        
-        if x.shape[-1] % 2 == 1:
-            x_first, x_rest = x[..., 0], x[..., 1:]
-            if x_rest.shape[-1] > 0:
-                x_rest = F.avg_pool1d(x_rest, kernel_size=2, stride=2)
-
-            x = torch.cat([x_first[..., None], x_rest], dim=-1)
-        else:
-            x = F.avg_pool1d(x, kernel_size=2, stride=2)
-        x = rearrange(x, '(b h w) c f -> (b f) c h w', b=batch_size, h=height, w=width)
-        return x
-
-    def forward(self, x, context, cam_emb, t_mod, freqs):
-        # msa: multi-head self-attention  mlp: multi-layer perceptron
-        # shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-        #     self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
-        # input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-
-        # # encode camera
-        # cam_emb = self.cam_encoder(cam_emb)
-        # cam_emb = cam_emb.repeat(1, 2, 1, 1, 1)
-        # cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
-        # input_x = input_x + cam_emb
-        # x = x + gate_msa * self.projector(self.self_attn(input_x, freqs))
-        
-        # x = x + self.cross_attn(self.norm3(x), context)
-        # input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        # x = x + gate_mlp * self.ffn(input_x)
-        batch_size, num_frames, channels, height, width = cam_emb.shape
-        controlnet_states = rearrange(controlnet_states, 'b f c h w -> (b f) c h w')
-        controlnet_states = self.unshuffle(controlnet_states)
-        controlnet_states = self.controlnet_encode_first(controlnet_states)
-        controlnet_states = self.compress_time(controlnet_states, num_frames=num_frames) 
-        num_frames = controlnet_states.shape[0] // batch_size
-
-        controlnet_states = self.controlnet_encode_second(controlnet_states)
-        controlnet_states = self.compress_time(controlnet_states, num_frames=num_frames) 
-        controlnet_states = rearrange(controlnet_states, '(b f) c h w -> b f c h w', b=batch_size)
-        
-
-
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-
-        # encode camera
-        cam_emb = self.cam_encoder(cam_emb)
-        cam_emb = cam_emb.repeat(1, 2, 1)
-        cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, 30, 52, 1)
-        cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
-        input_x = input_x + cam_emb
-        x = x + gate_msa * self.projector(self.self_attn(input_x, freqs))
-        
-        x = x + self.cross_attn(self.norm3(x), context)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp * self.ffn(input_x)
-        return x
 
 class MLP(torch.nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -391,11 +283,29 @@ class WanModel(torch.nn.Module):
             DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
             for _ in range(num_layers)
         ])
+        #### add cam process block ###
+        in_channels = 6 
+        downscale_coef = 8
+        start_channels = in_channels * (downscale_coef ** 2)
+        input_channels = [start_channels, start_channels // 2, start_channels // 4]
+        self.unshuffle = nn.PixelUnshuffle(downscale_coef)
+
+        self.controlnet_encode_first = nn.Sequential(
+            nn.Conv2d(input_channels[0], input_channels[1], kernel_size=1, stride=1, padding=0),
+            nn.GroupNorm(2, input_channels[1]),
+            nn.ReLU(),
+        )
+
+        self.controlnet_encode_second = nn.Sequential(
+            nn.Conv2d(input_channels[1], input_channels[2], kernel_size=1, stride=1, padding=0),
+            nn.GroupNorm(2, input_channels[2]),
+            nn.ReLU(),
+        )
         #### add controlnet
         self.num_control_layers = num_control_layers
         self.control_blocks = nn.ModuleList()
         for i in range(num_control_layers):
-            copied_block = ControlBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+            copied_block = DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
             copied_block.zero_linear = nn.Linear(dim, dim, bias=False)  # zero linear
             nn.init.zeros_(copied_block.zero_linear.weight)
             self.control_blocks.append(copied_block)
@@ -419,6 +329,21 @@ class WanModel(torch.nn.Module):
             f=grid_size[0], h=grid_size[1], w=grid_size[2], 
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
+    def compress_time(self, x, num_frames):
+        x = rearrange(x, '(b f) c h w -> b f c h w', f=num_frames)
+        batch_size, frames, channels, height, width = x.shape
+        x = rearrange(x, 'b f c h w -> (b h w) c f')
+        
+        if x.shape[-1] % 2 == 1:
+            x_first, x_rest = x[..., 0], x[..., 1:]
+            if x_rest.shape[-1] > 0:
+                x_rest = F.avg_pool1d(x_rest, kernel_size=2, stride=2)
+
+            x = torch.cat([x_first[..., None], x_rest], dim=-1)
+        else:
+            x = F.avg_pool1d(x, kernel_size=2, stride=2)
+        x = rearrange(x, '(b h w) c f -> (b f) c h w', b=batch_size, h=height, w=width)
+        return x
 
     def forward(self,
                 x: torch.Tensor,
@@ -434,6 +359,22 @@ class WanModel(torch.nn.Module):
                 use_gradient_checkpointing_offload: bool = False,
                 **kwargs,
                 ):
+        ########## add cam process block ##########
+        batch_size, num_frames, channels, height, width = cam_emb.shape
+        cam_emb = rearrange(cam_emb, 'b f c h w -> (b f) c h w')
+        cam_emb = self.unshuffle(cam_emb)
+        cam_emb = self.controlnet_encode_first(cam_emb)
+        cam_emb = self.compress_time(cam_emb, num_frames=num_frames) 
+        num_frames = cam_emb.shape[0] // batch_size
+
+        cam_emb = self.controlnet_encode_second(cam_emb)
+        cam_emb = self.compress_time(cam_emb, num_frames=num_frames) 
+        cam_emb = rearrange(cam_emb, '(b f) c h w -> b f c h w', b=batch_size)
+
+        cam_emb = rearrange(cam_emb, 'b f c h w -> b c f h w')
+        x_c = torch.cat([x_c, cam_emb], dim=1)
+        ########## add cam process block ##########
+
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
@@ -491,7 +432,7 @@ class WanModel(torch.nn.Module):
                     if idx < self.num_control_layers:
                         x_c = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(self.control_blocks[idx]),
-                            x_c, context, cam_emb, t_mod, freqs_c,
+                            x_c, context, t_mod, freqs_c,
                             use_reentrant=False,
                         ) # x: [1, 1560, 1536]
                         x = x + self.control_blocks[idx].zero_linear(x_c)[:,:x.shape[1]]
@@ -499,7 +440,7 @@ class WanModel(torch.nn.Module):
             else:
                 x = block(x, context, t_mod, freqs)
                 if idx < self.num_control_layers:
-                    x_c = self.control_blocks[idx](x_c, context, cam_emb, t_mod, freqs_c)
+                    x_c = self.control_blocks[idx](x_c, context, t_mod, freqs_c)
                     x = x + self.control_blocks[idx].zero_linear(x_c)[:,:x.shape[1]]
 
         x = self.head(x, t)
