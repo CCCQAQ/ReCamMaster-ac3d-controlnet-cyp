@@ -1,0 +1,47 @@
+task: train
+dataset_path: /mnt/afs/chenxinyu/datasets/recam/MultiCamVideo-Dataset/recam-caption-train.json
+output_path: /mnt/afs/chenxinyu/results/ori_controlnet_dbg
+
+text_encoder_path:  /mnt/afs/chenxinyu/checkpoints/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+image_encoder_path:
+vae_path: /mnt/afs/chenxinyu/checkpoints/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+dit_path: /mnt/afs/chenxinyu/checkpoints/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors
+recam_dit_path: /mnt/afs/chenxinyu/checkpoints/ReCamMaster/step20000.ckpt
+
+tiled: False 
+tile_size_height: 34
+tile_size_width: 34
+tile_stride_height: 18
+tile_stride_width: 16
+steps_per_epoch: 8000
+# steps_per_epoch: 1
+num_frames: 81
+height: 480
+width: 832
+dataloader_num_workers: 4
+learning_rate: 1e-4
+accumulate_grad_batches: 1
+max_epochs: 100
+# max_epochs: 1
+training_strategy: deepspeed_stage_1
+use_gradient_checkpointing: True
+use_gradient_checkpointing_offload: False
+use_swanlab: False
+swanlab_mode: None
+metadata_file_name: metadata.csv
+resume_ckpt_path: None
+
+
+dit_kwargs:
+  has_image_input: False
+  patch_size: [1, 2, 2]
+  in_dim: 16
+  dim: 1536
+  ffn_dim: 8960
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 16
+  num_heads: 12
+  num_layers: 30
+  num_control_layers: 15
+  eps: 1e-6
